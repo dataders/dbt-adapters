@@ -15,7 +15,12 @@ from typing import (
 
 from dbt.adapters.base.impl import AdapterConfig, ConstraintSupport
 from dbt.adapters.base.meta import available
-from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
+from dbt.adapters.capability import (
+    CapabilityDict,
+    CapabilitySupport,
+    Support,
+    Capability,
+)
 from dbt.adapters.catalogs import (
     CatalogIntegration,
     CatalogIntegrationConfig,
@@ -23,6 +28,23 @@ from dbt.adapters.catalogs import (
 )
 
 from dbt.adapters.contracts.relation import RelationConfig
+from dbt.adapters.planning import (
+    CreateFromQueryFacts,
+    CreateFromQueryStrategy,
+    CreateFromQueryStrategyOffer,
+    DdlAtomicity,
+    IncrementalCatalogStaging,
+    IncrementalMutationFacts,
+    IncrementalMutationStrategy,
+    IncrementalMutationStrategyOffer,
+    IncrementalSourceConsistency,
+    IncrementalStrategyRequirements,
+    IncrementalTempRelationType,
+    IncrementalUniqueKeyRequirement,
+    PlanProvenance,
+    incremental_renderer_macro,
+    incremental_strategy,
+)
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.events.types import ColTypeChange
 from dbt.adapters.cache import _make_ref_key_dict
@@ -168,7 +190,10 @@ class SnowflakeAdapter(SQLAdapter):
 
     @property
     def _behavior_flags(self) -> list[BehaviorFlag]:
-        return [SNOWFLAKE_DEFAULT_TRANSIENT_DYNAMIC_TABLES, SNOWFLAKE_MANAGED_ICEBERG_DEFAULT]
+        return [
+            SNOWFLAKE_DEFAULT_TRANSIENT_DYNAMIC_TABLES,
+            SNOWFLAKE_MANAGED_ICEBERG_DEFAULT,
+        ]
 
     def __init__(self, config, mp_context) -> None:
         super().__init__(config, mp_context)
@@ -508,7 +533,10 @@ class SnowflakeAdapter(SQLAdapter):
             grantee = row["grantee_name"]
             granted_to = row["granted_to"]
             privilege = row["privilege"]
-            if privilege != "OWNERSHIP" and granted_to not in ["SHARE", "DATABASE_ROLE"]:
+            if privilege != "OWNERSHIP" and granted_to not in [
+                "SHARE",
+                "DATABASE_ROLE",
+            ]:
                 if privilege in grants_dict.keys():
                     grants_dict[privilege].append(grantee)
                 else:
@@ -606,6 +634,95 @@ CALL {proc_name}();
     def valid_incremental_strategies(self):
         return ["append", "merge", "delete+insert", "microbatch", "insert_overwrite"]
 
+    def get_incremental_catalog_staging(
+        self, catalog_relation: Optional[CatalogRelation]
+    ) -> IncrementalCatalogStaging:
+        is_catalog_linked = bool(
+            catalog_relation is not None
+            and getattr(catalog_relation, "catalog_linked_database", None)
+        )
+        if is_catalog_linked:
+            return IncrementalCatalogStaging.PERMANENT_TABLE_ONLY
+        return IncrementalCatalogStaging.STANDARD
+
+    def get_incremental_mutation_strategy_offers(
+        self, facts: IncrementalMutationFacts
+    ) -> Tuple[IncrementalMutationStrategyOffer, ...]:
+        requested = facts.requested_strategy
+        if requested in self.builtin_incremental_strategies() and requested not in set(
+            self.valid_incremental_strategies()
+        ) | {"default"}:
+            return super().get_incremental_mutation_strategy_offers(facts)
+
+        strategy = incremental_strategy(requested)
+        unique_key_requirement = IncrementalUniqueKeyRequirement.OPTIONAL
+        if strategy in (
+            IncrementalMutationStrategy.APPEND,
+            IncrementalMutationStrategy.INSERT_OVERWRITE,
+        ):
+            unique_key_requirement = IncrementalUniqueKeyRequirement.IGNORED
+
+        requires_stable_reuse = facts.unique_key_present and strategy in (
+            IncrementalMutationStrategy.DELETE_INSERT,
+            IncrementalMutationStrategy.MICROBATCH,
+        )
+        source_consistency = (
+            IncrementalSourceConsistency.STABLE_REUSE
+            if requires_stable_reuse
+            else IncrementalSourceConsistency.SINGLE_EVALUATION
+        )
+
+        allowed_temp_relation_types: Tuple[IncrementalTempRelationType, ...]
+        default_temp_relation_type: IncrementalTempRelationType
+        if (
+            facts.language != "sql"
+            or facts.catalog_staging == IncrementalCatalogStaging.PERMANENT_TABLE_ONLY
+        ):
+            allowed_temp_relation_types = (IncrementalTempRelationType.TABLE,)
+            default_temp_relation_type = IncrementalTempRelationType.TABLE
+        elif requires_stable_reuse:
+            allowed_temp_relation_types = (
+                IncrementalTempRelationType.TABLE,
+                IncrementalTempRelationType.TRANSIENT,
+            )
+            default_temp_relation_type = IncrementalTempRelationType.TABLE
+        else:
+            allowed_temp_relation_types = (
+                IncrementalTempRelationType.VIEW,
+                IncrementalTempRelationType.TABLE,
+                IncrementalTempRelationType.TRANSIENT,
+            )
+            default_temp_relation_type = (
+                IncrementalTempRelationType.TABLE
+                if strategy == IncrementalMutationStrategy.CUSTOM
+                else IncrementalTempRelationType.VIEW
+            )
+
+        requirements = IncrementalStrategyRequirements(
+            unique_key=unique_key_requirement,
+            source_consistency=source_consistency,
+            allowed_temp_relation_types=allowed_temp_relation_types,
+            default_temp_relation_type=default_temp_relation_type,
+        )
+        renderer_macro = incremental_renderer_macro(requested)
+        return (
+            IncrementalMutationStrategyOffer.available(
+                strategy=strategy,
+                renderer_macro=renderer_macro,
+                atomicity=DdlAtomicity.UNKNOWN,
+                requirements=requirements,
+                provenance=(
+                    PlanProvenance(
+                        rule=f"snowflake.incremental.{strategy.value}",
+                        detail=(
+                            f"Resolved '{requested}' with {source_consistency.value} source "
+                            f"consistency and '{default_temp_relation_type.value}' staging"
+                        ),
+                    ),
+                ),
+            ),
+        )
+
     def debug_query(self):
         """Override for DebugTask method"""
         self.execute("select 1 as id")
@@ -622,15 +739,15 @@ CALL {proc_name}();
 
             catalog = config._extra.get("catalog")
 
-            if _table_format := config._extra.get("table_format"):  # type:ignore
+            if _table_format := config._extra.get("table_format"):  # type: ignore
                 run_info["table_format"] = _table_format
             elif not catalog:
                 # no table_format and no catalog definitely means info schema table
                 run_info["table_format"] = constants.INFO_SCHEMA_TABLE_FORMAT
-            elif catalog == constants.DEFAULT_INFO_SCHEMA_CATALOG.name:  # type:ignore
+            elif catalog == constants.DEFAULT_INFO_SCHEMA_CATALOG.name:  # type: ignore
                 # if the user happens to set the catalog to the info schema catalog, catch that
                 run_info["table_format"] = constants.INFO_SCHEMA_TABLE_FORMAT
-            elif catalog == constants.DEFAULT_ICEBERG_REST_CATALOG.name:  # type:ignore
+            elif catalog == constants.DEFAULT_ICEBERG_REST_CATALOG.name:  # type: ignore
                 # if the user happens to set the catalog to the iceberg rest catalog, catch that
                 run_info["table_format"] = constants.ICEBERG_TABLE_FORMAT
             else:  # catalog is set, and it's not the info schema catalog
@@ -662,6 +779,107 @@ CALL {proc_name}();
                 )
             return catalog_integration.build_relation(model)
         return None
+
+    def get_create_from_query_catalog_provider(
+        self,
+        catalog_relation: CatalogRelation,
+        model: Optional[RelationConfig],
+    ) -> Optional[str]:
+        return self._create_from_query_fact_value(
+            getattr(catalog_relation, "catalog_linked_database_type", None),
+            canonical=True,
+        )
+
+    def get_create_from_query_strategy_offers(
+        self, temporary: bool, facts: CreateFromQueryFacts
+    ) -> Tuple[CreateFromQueryStrategyOffer, ...]:
+        if temporary:
+            return (
+                CreateFromQueryStrategyOffer.available(
+                    strategy=CreateFromQueryStrategy.CTAS,
+                    atomicity=DdlAtomicity.STATEMENT,
+                    renderer_macro="snowflake__render_create_from_query_temporary",
+                    provenance=(
+                        PlanProvenance(
+                            rule="snowflake.create_from_query.temporary",
+                            detail="Temporary Snowflake relations use temporary-table CTAS",
+                        ),
+                    ),
+                ),
+            )
+
+        catalog_type = facts.catalog.catalog_type
+        if catalog_type == "iceberg_rest" and facts.catalog.catalog_provider == "glue":
+            return (
+                CreateFromQueryStrategyOffer.rejected(
+                    strategy=CreateFromQueryStrategy.CTAS,
+                    reason="Snowflake Glue catalog-linked databases do not support CTAS",
+                    provenance=(
+                        PlanProvenance(
+                            rule="snowflake.create_from_query.glue.ctas_rejected",
+                            detail="Resolved catalog provider is Glue",
+                        ),
+                    ),
+                ),
+                CreateFromQueryStrategyOffer.available(
+                    strategy=CreateFromQueryStrategy.CREATE_THEN_INSERT,
+                    atomicity=DdlAtomicity.BEST_EFFORT,
+                    renderer_macro="snowflake__render_create_from_query_glue",
+                    provenance=(
+                        PlanProvenance(
+                            rule="snowflake.create_from_query.glue.create_then_insert",
+                            detail="Glue uses explicit CREATE ICEBERG TABLE followed by INSERT",
+                        ),
+                    ),
+                ),
+            )
+
+        renderer_by_catalog = {
+            "info_schema": "snowflake__render_create_from_query_info_schema",
+            "built_in": "snowflake__render_create_from_query_built_in",
+            "iceberg_rest": "snowflake__render_create_from_query_iceberg_rest",
+        }
+        renderer_macro = (
+            renderer_by_catalog.get(catalog_type) if catalog_type is not None else None
+        )
+        if renderer_macro is not None:
+            return (
+                CreateFromQueryStrategyOffer.available(
+                    strategy=CreateFromQueryStrategy.CTAS,
+                    atomicity=DdlAtomicity.BEST_EFFORT,
+                    renderer_macro=renderer_macro,
+                    provenance=(
+                        PlanProvenance(
+                            rule=f"snowflake.create_from_query.{catalog_type}.ctas",
+                            detail=f"Resolved Snowflake catalog type is {catalog_type}",
+                        ),
+                    ),
+                ),
+            )
+
+        reason = f"Snowflake catalog type '{catalog_type}' has no create-from-query strategy"
+        return (
+            CreateFromQueryStrategyOffer.rejected(
+                strategy=CreateFromQueryStrategy.CTAS,
+                reason=reason,
+                provenance=(
+                    PlanProvenance(
+                        rule="snowflake.create_from_query.catalog_unsupported",
+                        detail=reason,
+                    ),
+                ),
+            ),
+            CreateFromQueryStrategyOffer.rejected(
+                strategy=CreateFromQueryStrategy.CREATE_THEN_INSERT,
+                reason=reason,
+                provenance=(
+                    PlanProvenance(
+                        rule="snowflake.create_from_query.catalog_unsupported",
+                        detail=reason,
+                    ),
+                ),
+            ),
+        )
 
     @available
     def describe_dynamic_table(
@@ -710,7 +928,12 @@ CALL {proc_name}();
             is_transient = self._query_dynamic_table_transient_status(relation)
             # choosing a future proof column name
             selected = selected.compute(
-                [("transient", agate.Formula(agate.Boolean(), lambda row: is_transient))]
+                [
+                    (
+                        "transient",
+                        agate.Formula(agate.Boolean(), lambda row: is_transient),
+                    )
+                ]
             )
 
         return {"dynamic_table": selected}

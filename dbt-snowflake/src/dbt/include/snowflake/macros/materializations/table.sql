@@ -25,7 +25,11 @@
   {% endif %}
 
   {% call statement('main', language=language) -%}
-      {{ create_table_as(False, target_relation, compiled_code, language) }}
+      {% if language == 'sql' %}
+        {{ get_create_table_as_sql(False, target_relation, compiled_code) }}
+      {% else %}
+        {{ create_table_as(False, target_relation, compiled_code, language) }}
+      {% endif %}
   {%- endcall %}
 
   {{ run_hooks(post_hooks) }}

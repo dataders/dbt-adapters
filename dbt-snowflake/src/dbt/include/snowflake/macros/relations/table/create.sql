@@ -6,15 +6,15 @@
         {%- if temporary -%}
             {{ snowflake__create_table_temporary_sql(relation, compiled_code) }}
         {%- elif catalog_relation.catalog_type == 'INFO_SCHEMA' -%}
-            {{ snowflake__create_table_info_schema_sql(relation, compiled_code) }}
+            {{ snowflake__create_table_info_schema_sql(relation, compiled_code, catalog_relation) }}
         {%- elif catalog_relation.catalog_type == 'BUILT_IN' -%}
-            {{ snowflake__create_table_built_in_sql(relation, compiled_code) }}
+            {{ snowflake__create_table_built_in_sql(relation, compiled_code, catalog_relation) }}
         {%- elif catalog_relation.catalog_type == 'ICEBERG_REST' -%}
             {%- if catalog_relation.catalog_linked_database_type is defined and
             catalog_relation.catalog_linked_database_type == 'glue' -%}
                 {{ snowflake__create_table_iceberg_rest_with_glue(relation, compiled_code, catalog_relation) }}
             {%- else -%}
-                {{ snowflake__create_table_iceberg_rest_sql(relation, compiled_code) }}
+                {{ snowflake__create_table_iceberg_rest_sql(relation, compiled_code, catalog_relation) }}
             {%- endif -%}
         {%- else -%}
             {% do exceptions.raise_compiler_error('Unexpected model config for: ' ~ relation) %}
@@ -33,6 +33,35 @@
     {%- endif -%}
 
 {% endmacro %}
+
+
+{% macro snowflake__render_create_from_query_temporary(plan, relation, compiled_code) -%}
+    {{ snowflake__create_table_temporary_sql(relation, compiled_code) }}
+{%- endmacro %}
+
+
+{% macro snowflake__render_create_from_query_info_schema(plan, relation, compiled_code) -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+    {{ snowflake__create_table_info_schema_sql(relation, compiled_code, catalog_relation) }}
+{%- endmacro %}
+
+
+{% macro snowflake__render_create_from_query_built_in(plan, relation, compiled_code) -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+    {{ snowflake__create_table_built_in_sql(relation, compiled_code, catalog_relation) }}
+{%- endmacro %}
+
+
+{% macro snowflake__render_create_from_query_iceberg_rest(plan, relation, compiled_code) -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+    {{ snowflake__create_table_iceberg_rest_sql(relation, compiled_code, catalog_relation) }}
+{%- endmacro %}
+
+
+{% macro snowflake__render_create_from_query_glue(plan, relation, compiled_code) -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+    {{ snowflake__create_table_iceberg_rest_with_glue(relation, compiled_code, catalog_relation) }}
+{%- endmacro %}
 
 
 {% macro snowflake__create_table_transient_sql(relation, compiled_code) -%}
@@ -93,14 +122,16 @@ as (
 {%- endmacro %}
 
 
-{% macro snowflake__create_table_info_schema_sql(relation, compiled_code) -%}
+{% macro snowflake__create_table_info_schema_sql(relation, compiled_code, catalog_relation=none) -%}
 {#-
     Implements CREATE TABLE and CREATE TABLE ... AS SELECT:
     https://docs.snowflake.com/en/sql-reference/sql/create-table
     https://docs.snowflake.com/en/sql-reference/sql/create-table#create-table-as-select-also-referred-to-as-ctas
 -#}
 
-{%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- if catalog_relation is none -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- endif -%}
 
 {%- if catalog_relation.is_transient -%}
     {%- set transient='transient ' -%}
@@ -158,7 +189,7 @@ alter table {{ relation }} resume recluster;
 {%- endmacro %}
 
 
-{% macro snowflake__create_table_built_in_sql(relation, compiled_code) -%}
+{% macro snowflake__create_table_built_in_sql(relation, compiled_code, catalog_relation=none) -%}
 {#-
     Implements CREATE ICEBERG TABLE and CREATE ICEBERG TABLE ... AS SELECT (Snowflake as the Iceberg catalog):
     https://docs.snowflake.com/en/sql-reference/sql/create-iceberg-table-snowflake
@@ -167,7 +198,9 @@ alter table {{ relation }} resume recluster;
     - Iceberg does not support temporary tables (use a standard Snowflake table)
 -#}
 
-{%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- if catalog_relation is none -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- endif -%}
 
 {%- set partition_by_keys = get_partition_by_keys(catalog_relation) -%}
 {%- if partition_by_keys -%}
@@ -233,7 +266,7 @@ alter iceberg table {{ relation }} resume recluster;
 {%- endmacro %}
 
 
-{% macro snowflake__create_table_iceberg_rest_sql(relation, compiled_code) -%}
+{% macro snowflake__create_table_iceberg_rest_sql(relation, compiled_code, catalog_relation=none) -%}
 {#-
     Implements CREATE ICEBERG TABLE for Iceberg REST catalogs with Catalog Linked Databases.
     https://docs.snowflake.com/en/sql-reference/sql/create-iceberg-table-rest
@@ -247,7 +280,9 @@ alter iceberg table {{ relation }} resume recluster;
     Note: Iceberg REST writes only work with Catalog Linked Databases (CLD).
 -#}
 
-{%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- if catalog_relation is none -%}
+    {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
+{%- endif -%}
 
 {%- set copy_grants = config.get('copy_grants', default=false) -%}
 

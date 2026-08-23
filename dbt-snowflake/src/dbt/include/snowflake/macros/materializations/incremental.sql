@@ -1,82 +1,15 @@
 {% macro dbt_snowflake_get_tmp_relation_type(strategy, unique_key, language) %}
-{%- set tmp_relation_type = config.get('tmp_relation_type') -%}
-  /* {#
-       High-level principles:
-       If we are running multiple statements (DELETE + INSERT),
-       and we want to guarantee identical inputs to both statements,
-       then we must first save the model query results as a temporary table
-       (which presumably comes with a performance cost).
-       If we are running a single statement (MERGE or INSERT alone),
-       we _may_ save the model query definition as a view instead,
-       for (presumably) faster overall incremental processing.
-
-       Low-level specifics:
-       If an invalid option is specified, then we will raise an
-       exception with a corresponding message.
-
-       Languages other than SQL (like Python) will use a temporary table.
-       With the default strategy of merge, the user may choose between a
-       temporary table and view (defaulting to view).
-
-       The append strategy can use a view because it will run a single INSERT
-       statement.
-
-       When unique_key is none, the delete+insert and microbatch strategies
-       can use a view because a single INSERT statement is run with no DELETES
-       as part of the statement. Otherwise, play it safe by using a table.
-
-       Catalog-linked databases (Iceberg tables) do not support temporary
-       relations or transient tables — only Iceberg tables are allowed. A
-       permanent table is used as the tmp relation for CLD models.
-
-       'transient' is also available as a user-facing tmp_relation_type for
-       non-Iceberg models. Unlike session-scoped temporary tables, transient
-       tables are visible to Snowflake's lineage tracking. Note that transient
-       tables share the regular schema namespace; use the
-       snowflake__resolve_incremental_tmp_relation dispatch macro to redirect
-       tmp relations to a dedicated schema to avoid name collisions when
-       multiple runs share the same target schema.
-  #} */
-
-  {% if language == "python" and tmp_relation_type is not none and tmp_relation_type != "table" %}
-    {% do exceptions.raise_compiler_error(
-      "Python models currently only support 'table' for tmp_relation_type but "
-       ~ tmp_relation_type ~ " was specified."
-    ) %}
-  {% endif %}
-
-  {#-- Python always uses a temporary table, regardless of other conditions --#}
-  {% if language != "sql" %}
-    {{ return("table") }}
-  {% endif %}
-
-  {#-- CLD schemas only support Iceberg tables; use table (not transient) --#}
-  {% if snowflake__is_catalog_linked_database(relation=config.model) %}
-    {{ return("table") }}
-  {% endif %}
-
-  {% if strategy in ["delete+insert", "microbatch"] and tmp_relation_type is not none and tmp_relation_type not in ("table", "transient") and unique_key is not none %}
-    {% do exceptions.raise_compiler_error(
-      "In order to maintain consistent results when `unique_key` is not none,
-      the `" ~ strategy ~ "` strategy only supports `table` or `transient` for `tmp_relation_type` but "
-      ~ tmp_relation_type ~ " was specified."
-      )
-  %}
-  {% endif %}
-
-  {% if tmp_relation_type == "table" %}
-    {{ return("table") }}
-  {% elif tmp_relation_type == "view" %}
-    {{ return("view") }}
-  {% elif tmp_relation_type == "transient" %}
-    {{ return("transient") }}
-  {% elif strategy in ("default", "merge", "append", "insert_overwrite") %}
-    {{ return("view") }}
-  {% elif strategy in ["delete+insert", "microbatch"] and unique_key is none %}
-    {{ return("view") }}
-  {% else %}
-    {{ return("table") }}
-  {% endif %}
+  {# Compatibility entry point: projects may still override this macro. #}
+  {% set catalog_relation = adapter.build_catalog_relation(config.model) %}
+  {% set plan = adapter.plan_incremental_mutation(
+      strategy,
+      language=language,
+      unique_key=unique_key,
+      requested_temp_relation_type=config.get('tmp_relation_type'),
+      catalog_relation=catalog_relation
+  ) %}
+  {% do adapter.get_incremental_plan_macro(context, plan) %}
+  {{ return(plan.temp_relation_type.value) }}
 {% endmacro %}
 
 
@@ -126,6 +59,14 @@
   {#-- The temp relation will be a view (faster) or temp table, depending on upsert/merge strategy --#}
   {%- set unique_key = config.get('unique_key') -%}
   {% set incremental_strategy = config.get('incremental_strategy') or 'default' %}
+  {% set incremental_plan = adapter.plan_incremental_mutation(
+      incremental_strategy,
+      language=language,
+      unique_key=unique_key,
+      requested_temp_relation_type=config.get('tmp_relation_type'),
+      catalog_relation=catalog_relation
+  ) %}
+  {% set strategy_sql_macro_func = adapter.get_incremental_plan_macro(context, incremental_plan) %}
   {% set tmp_relation_type = dbt_snowflake_get_tmp_relation_type(incremental_strategy, unique_key, language) %}
 
   {% if is_catalog_linked_db %}
@@ -199,13 +140,19 @@
       {% set dest_columns = adapter.get_columns_in_relation(existing_relation) %}
     {% endif %}
 
-    {#-- Get the incremental_strategy, the macro to use for the strategy, and build the sql --#}
+    {#-- Build typed late-bound arguments for the resolved strategy renderer --#}
     {% set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) %}
-    {% set strategy_sql_macro_func = adapter.get_incremental_strategy_macro(context, incremental_strategy) %}
-    {% set strategy_arg_dict = ({'target_relation': target_relation, 'temp_relation': tmp_relation, 'unique_key': unique_key, 'dest_columns': dest_columns, 'incremental_predicates': incremental_predicates, 'catalog_relation': catalog_relation }) %}
+    {% set strategy_arguments = adapter.plan_incremental_arguments(
+        target_relation=target_relation,
+        temp_relation=tmp_relation,
+        unique_key=unique_key,
+        dest_columns=dest_columns,
+        incremental_predicates=incremental_predicates,
+        adapter_arguments={'catalog_relation': catalog_relation}
+    ) %}
 
     {%- call statement('main') -%}
-      {{ strategy_sql_macro_func(strategy_arg_dict) }}
+      {{ strategy_sql_macro_func(strategy_arguments.to_macro_dict()) }}
     {%- endcall -%}
   {% endif %}
 
