@@ -206,6 +206,8 @@ def test_snowflake_runtime_and_catalog_facts_require_table_staging(facts):
 
     assert plan.temp_relation_type == IncrementalTempRelationType.TABLE
     assert plan.requirements.allowed_temp_relation_types == (IncrementalTempRelationType.TABLE,)
+    if "catalog_staging" in facts:
+        assert plan.catalog_staging == IncrementalCatalogStaging.PERMANENT_TABLE_ONLY
 
 
 def test_snowflake_custom_strategy_preserves_table_staging_default():

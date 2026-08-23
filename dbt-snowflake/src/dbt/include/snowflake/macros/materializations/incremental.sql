@@ -44,8 +44,6 @@
   {%- set identifier = this.name -%}
   {%- set catalog_relation = adapter.build_catalog_relation(config.model) -%}
 
-  {%- set is_catalog_linked_db = snowflake__is_catalog_linked_database(relation=none, catalog_relation=catalog_relation) -%}
-
   {%- set target_relation = api.Relation.create(
 	identifier=identifier,
 	schema=schema,
@@ -67,9 +65,10 @@
       catalog_relation=catalog_relation
   ) %}
   {% set strategy_sql_macro_func = adapter.get_incremental_plan_macro(context, incremental_plan) %}
+  {% set uses_permanent_table_staging = incremental_plan.catalog_staging.value == 'permanent_table_only' %}
   {% set tmp_relation_type = dbt_snowflake_get_tmp_relation_type(incremental_strategy, unique_key, language) %}
 
-  {% if is_catalog_linked_db %}
+  {% if uses_permanent_table_staging %}
     {% set tmp_relation = make_temp_relation(this).incorporate(type=tmp_relation_type, catalog=catalog_relation.catalog_name, is_table=true) %}
   {% else %}
     {#-- Transient tables are dropped with DROP TABLE, so the relation type must be 'table' --#}
@@ -113,7 +112,7 @@
 
   {% else %}
     {#-- Create the temp relation as a view, temp table, or transient table --#}
-    {% if is_catalog_linked_db %}
+    {% if uses_permanent_table_staging %}
         {%- call statement('create_tmp_relation', language=language) -%}
           {{ create_table_as(False, tmp_relation, compiled_code, language) }}
         {%- endcall -%}
